@@ -1,14 +1,9 @@
-"""Agent 2 — Brave Search API for discovering discussion URLs."""
-import httpx
-from urllib.parse import quote_plus
+"""Agent 2 — DuckDuckGo search for discovering discussion URLs (no API key needed)."""
+from duckduckgo_search import DDGS
 from agents.state import AgentState
-from utils.config import get_settings
 
 SKIP_DOMAINS = {"google.com", "facebook.com", "twitter.com", "instagram.com",
                 "youtube.com", "amazon.com", "wikipedia.org", "linkedin.com"}
-
-DISCUSSION_SITES = ["reddit.com", "news.ycombinator.com", "stackoverflow.com",
-                    "dev.to", "medium.com", "hackernews"]
 
 
 def run_search_agent(state: AgentState) -> AgentState:
@@ -16,14 +11,13 @@ def run_search_agent(state: AgentState) -> AgentState:
     topics = intent.get("topics", [])
     entities = intent.get("entities", [])
     query = state["query"]
-    s = get_settings()
 
     sub_queries = _build_sub_queries(query, topics, entities)
     all_urls: list[str] = []
 
-    with httpx.Client(timeout=15) as client:
+    with DDGS() as ddgs:
         for sub_q in sub_queries:
-            urls = _brave_search(client, sub_q, s.BRAVE_API_KEY)
+            urls = _ddg_search(ddgs, sub_q)
             all_urls.extend(urls)
 
     unique_urls = _deduplicate(all_urls)
@@ -37,30 +31,20 @@ def run_search_agent(state: AgentState) -> AgentState:
 
 
 def _build_sub_queries(original: str, topics: list[str], entities: list[str]) -> list[str]:
-    queries = [f"{original} discussion forum"]
+    queries = [f"{original} reddit discussion"]
     for topic in topics[:2]:
-        queries.append(f"{topic} reddit discussion community")
+        queries.append(f"{topic} reddit community opinions")
     if entities:
-        queries.append(f"{' '.join(entities[:2])} community opinions reddit")
+        queries.append(f"{' '.join(entities[:2])} reddit discussion forum")
     return queries[:3]
 
 
-def _brave_search(client: httpx.Client, query: str, api_key: str, count: int = 10) -> list[str]:
-    if not api_key:
-        print("[SearchAgent] No BRAVE_API_KEY — skipping web search")
-        return []
+def _ddg_search(ddgs: DDGS, query: str, max_results: int = 8) -> list[str]:
     try:
-        response = client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": count},
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-        )
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("web", {}).get("results", [])
-        return [r["url"] for r in results if r.get("url")]
+        results = ddgs.text(query, max_results=max_results)
+        return [r["href"] for r in results if r.get("href")]
     except Exception as e:
-        print(f"[SearchAgent] Brave search error: {e}")
+        print(f"[SearchAgent] DuckDuckGo error: {e}")
         return []
 
 

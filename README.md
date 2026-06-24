@@ -15,7 +15,7 @@ Agent 1: Query Understanding → checks Neo4j + ChromaDB coverage
     │                    │
   has data           no data
     │                    ▼
-    │         Agent 2: Brave Search → URLs
+    │         Agent 2: DuckDuckGo Search → URLs
     │                    ▼
     │         Agent 3: Crawl4AI + Pullpush.io → raw content
     │                    ▼
@@ -44,7 +44,7 @@ Agent 1: Query Understanding → checks Neo4j + ChromaDB coverage
    ollama pull llama3.2:3b
    ollama serve
    ```
-3. **Brave Search API** — free account at [search.brave.com/search/api](https://search.brave.com/search/api) (2000 searches/month free)
+3. **Web search** — uses **DuckDuckGo** (`duckduckgo-search` Python library) — no account or API key needed
 4. **Reddit data** — no credentials needed. Uses:
    - [Pullpush.io](https://api.pullpush.io) for historical Reddit posts/comments (free, no auth)
    - [Crawl4AI](https://github.com/unclecode/crawl4ai) for live Reddit page scraping

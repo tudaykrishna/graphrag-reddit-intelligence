@@ -3,8 +3,6 @@ from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    BRAVE_API_KEY: str = ""
-
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_FAST_MODEL: str = "llama3.2:3b"
     OLLAMA_SMART_MODEL: str = "llama3.1:8b"
