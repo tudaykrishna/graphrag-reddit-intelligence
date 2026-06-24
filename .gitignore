@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+chroma_db/
+graphrag-reddit-assignment.pdf
+.DS_Store
