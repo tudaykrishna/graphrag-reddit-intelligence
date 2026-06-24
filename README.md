@@ -17,7 +17,7 @@ Agent 1: Query Understanding → checks Neo4j + ChromaDB coverage
     │                    ▼
     │         Agent 2: Brave Search → URLs
     │                    ▼
-    │         Agent 3: Crawl4AI + AsyncPRAW → raw content
+    │         Agent 3: Crawl4AI + Pullpush.io → raw content
     │                    ▼
     │         Agent 4: Parser (Ollama llama3.2:3b) → entities/topics/sentiment
     │                    ▼
