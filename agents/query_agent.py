@@ -69,8 +69,8 @@ def _check_coverage(query: str, intent: dict) -> bool:
     if total_docs < 10:
         return False
 
-    results = similarity_search_with_score(query, top_k=5)
-    high_score = [r for r in results if r[1] < 0.6]
+    results = similarity_search_with_score(query, top_k=8)
+    high_score = [r for r in results if r[1] < 0.8]
     if len(high_score) >= 3:
         return True
 

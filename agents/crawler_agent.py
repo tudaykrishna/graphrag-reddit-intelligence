@@ -1,22 +1,25 @@
-"""Agent 3 — Crawl URLs via Crawl4AI; Reddit historical data via Pullpush.io (no auth needed)."""
+"""Agent 3 — Reddit historical data via Pullpush.io (no auth needed)."""
 import asyncio
 import time
-import re
-from urllib.parse import urlparse
 import httpx
-from crawl4ai import AsyncWebCrawler
 from agents.state import AgentState
 from utils.config import get_settings
 
 PULLPUSH_BASE = "https://api.pullpush.io"
 SUBREDDITS = ["MachineLearning", "LocalLLaMA", "artificial", "ChatGPT"]
 
+# Comment selection thresholds (by upvote score)
+COMMENT_TOP_N = 5     # top-level comments kept per post
+REPLY_TOP_N = 3       # replies kept per comment, applied at every depth
+COMMENT_MAX_DEPTH = 8  # safety guard against runaway recursion
+
 
 def run_crawler_agent(state: AgentState) -> AgentState:
-    urls = state.get("search_urls", [])
     intent = state.get("intent", {})
+    topics = intent.get("topics", [])
+    search_term = " ".join(topics[:2]) if topics else ""
 
-    content = asyncio.run(_crawl_all(urls, intent))
+    content = asyncio.run(_fetch_pullpush_data(search_term))
     valid = [c for c in content if c.get("content") and len(c["content"]) > 80]
     print(f"[CrawlerAgent] Collected {len(valid)} documents")
 
@@ -25,42 +28,6 @@ def run_crawler_agent(state: AgentState) -> AgentState:
         "crawled_content": valid,
         "agents_used": state.get("agents_used", []) + ["crawler_agent"],
     }
-
-
-async def _crawl_all(urls: list[str], intent: dict) -> list[dict]:
-    reddit_urls = [u for u in urls if "reddit.com" in u]
-    other_urls = [u for u in urls if "reddit.com" not in u]
-
-    topics = intent.get("topics", [])
-    search_term = " ".join(topics[:2]) if topics else ""
-
-    tasks = []
-    if reddit_urls:
-        tasks.append(_crawl_reddit_urls(reddit_urls))
-    if other_urls:
-        tasks.append(_crawl_web_batch(other_urls))
-    # Always pull some historical Reddit data via Pullpush
-    tasks.append(_fetch_pullpush_data(search_term))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    combined: list[dict] = []
-    for r in results:
-        if isinstance(r, list):
-            combined.extend(r)
-    return combined
-
-
-async def _crawl_reddit_urls(urls: list[str]) -> list[dict]:
-    """Scrape Reddit post pages with Crawl4AI (Playwright renders JS)."""
-    results = []
-    async with AsyncWebCrawler(verbose=False) as crawler:
-        tasks = [_crawl_single(crawler, url) for url in urls[:8]]
-        crawled = await asyncio.gather(*tasks, return_exceptions=True)
-        for item in crawled:
-            if isinstance(item, dict):
-                item["source_type"] = "reddit"
-                results.append(item)
-    return results
 
 
 async def _fetch_pullpush_data(search_term: str) -> list[dict]:
@@ -80,13 +47,27 @@ async def _fetch_pullpush_data(search_term: str) -> list[dict]:
     return results
 
 
+async def _pullpush_get(client: httpx.AsyncClient, path: str, params: dict, retries: int = 2) -> list[dict]:
+    """GET a Pullpush endpoint with simple retry/backoff; returns the `data` list (or [])."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = await client.get(f"{PULLPUSH_BASE}{path}", params=params)
+            resp.raise_for_status()
+            return resp.json().get("data", [])
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.8 * (attempt + 1))
+    raise last_err if last_err else RuntimeError("pullpush request failed")
+
+
 async def _pullpush_submissions(
     client: httpx.AsyncClient,
     subreddit: str,
     after: int,
     before: int,
     search_term: str,
-    size: int = 25,
+    size: int = 15,
 ) -> list[dict]:
     params: dict = {
         "subreddit": subreddit,
@@ -100,22 +81,31 @@ async def _pullpush_submissions(
         params["q"] = search_term
 
     try:
-        resp = await client.get(f"{PULLPUSH_BASE}/reddit/search/submission/", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        posts = data.get("data", [])
+        posts = await _pullpush_get(client, "/reddit/search/submission/", params)
     except Exception as e:
-        print(f"[CrawlerAgent] Pullpush submissions error ({subreddit}): {e}")
+        print(f"[CrawlerAgent] Pullpush submissions error ({subreddit}): {type(e).__name__}: {e}")
         return []
 
+    # Fetch comments for all posts concurrently (bounded) instead of one-at-a-time.
+    sem = asyncio.Semaphore(10)
+
+    async def _comments_for(pid: str) -> list[dict]:
+        async with sem:
+            return await _pullpush_comments(client, pid)
+
+    comment_lists = await asyncio.gather(
+        *[_comments_for(p.get("id", "")) for p in posts]
+    )
+
     results = []
-    for post in posts:
+    for post, raw_comments in zip(posts, comment_lists):
         post_id = post.get("id", "")
-        comments_text = await _pullpush_comments(client, post_id)
+        comment_tree = _build_comment_tree(raw_comments, post_id)
         body = post.get("selftext", "") or ""
-        content = f"Title: {post.get('title','')}\n\n{body}\n\nComments:\n" + "\n---\n".join(comments_text[:15])
+        content = f"Title: {post.get('title','')}\n\n{body}"
 
         results.append({
+            "reddit_id": post_id,
             "url": f"https://reddit.com{post.get('permalink','')}",
             "title": post.get("title", ""),
             "content": content,
@@ -124,62 +114,68 @@ async def _pullpush_submissions(
             "source_type": "reddit",
             "subreddit": subreddit,
             "score": post.get("score", 0),
+            "comments": comment_tree,
         })
     return results
 
 
 async def _pullpush_comments(
-    client: httpx.AsyncClient, post_id: str, size: int = 20
-) -> list[str]:
+    client: httpx.AsyncClient, post_id: str, size: int = 60
+) -> list[dict]:
+    """Fetch a flat list of raw comment dicts for a post (used to rebuild the tree)."""
     if not post_id:
         return []
     try:
-        resp = await client.get(
-            f"{PULLPUSH_BASE}/reddit/search/comment/",
-            params={"link_id": post_id, "size": size, "sort_type": "score", "sort": "desc"},
+        rows = await _pullpush_get(
+            client,
+            "/reddit/search/comment/",
+            {"link_id": post_id, "size": size, "sort_type": "score", "sort": "desc"},
         )
-        resp.raise_for_status()
-        data = resp.json()
         return [
-            f"u/{c.get('author','?')}: {c.get('body','')}"
-            for c in data.get("data", [])
-            if c.get("body") not in ("[deleted]", "[removed]", None)
+            c for c in rows
+            if c.get("body") not in ("[deleted]", "[removed]", None) and c.get("id")
         ]
-    except Exception:
+    except Exception as e:
+        print(f"[CrawlerAgent] Pullpush comments error ({post_id}): {type(e).__name__}: {e}")
         return []
 
 
-async def _crawl_web_batch(urls: list[str]) -> list[dict]:
-    results = []
-    async with AsyncWebCrawler(verbose=False) as crawler:
-        tasks = [_crawl_single(crawler, url) for url in urls[:8]]
-        crawled = await asyncio.gather(*tasks, return_exceptions=True)
-        for item in crawled:
-            if isinstance(item, dict):
-                results.append(item)
-    return results
+def _build_comment_tree(raw_comments: list[dict], post_id: str) -> list[dict]:
+    """Reconstruct a thresholded comment tree from a flat Pullpush comment list.
 
+    Keeps the top COMMENT_TOP_N top-level comments by score, then recursively the
+    top REPLY_TOP_N replies at each depth (capped at COMMENT_MAX_DEPTH).
+    Threading uses Reddit's parent_id prefixes: ``t3_`` = the post, ``t1_`` = a comment.
+    """
+    children: dict[str, list[dict]] = {}
+    for c in raw_comments:
+        parent = c.get("parent_id") or ""
+        children.setdefault(parent, []).append(c)
 
-async def _crawl_single(crawler: AsyncWebCrawler, url: str) -> dict | None:
-    try:
-        result = await crawler.arun(url=url)
-        if not result.success:
-            return None
-        markdown = result.markdown or ""
-        title = ""
-        if result.metadata:
-            title = result.metadata.get("title", "")
-        domain = urlparse(url).netloc.replace("www.", "")
+    def node(c: dict, depth: int) -> dict:
+        cid = c.get("id", "")
+        replies: list[dict] = []
+        if depth < COMMENT_MAX_DEPTH:
+            kids = sorted(
+                children.get(f"t1_{cid}", []),
+                key=lambda x: x.get("score", 0),
+                reverse=True,
+            )[:REPLY_TOP_N]
+            replies = [node(k, depth + 1) for k in kids]
         return {
-            "url": url,
-            "title": title,
-            "content": markdown[:5000],
-            "author": "web",
-            "timestamp": time.time(),
-            "source_type": "web",
-            "subreddit": domain,
-            "score": 0,
+            "id": cid,
+            "body": c.get("body", ""),
+            "author": c.get("author", "unknown"),
+            "score": c.get("score", 0),
+            "created_utc": float(c.get("created_utc", time.time())),
+            "parent_comment_id": None if depth == 0 else c.get("parent_id", "")[3:] or None,
+            "depth": depth,
+            "replies": replies,
         }
-    except Exception as e:
-        print(f"[CrawlerAgent] Crawl error {url}: {e}")
-        return None
+
+    top_level = sorted(
+        children.get(f"t3_{post_id}", []),
+        key=lambda x: x.get("score", 0),
+        reverse=True,
+    )[:COMMENT_TOP_N]
+    return [node(c, 0) for c in top_level]

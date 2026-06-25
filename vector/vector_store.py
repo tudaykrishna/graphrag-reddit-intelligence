@@ -25,9 +25,10 @@ def get_vector_store() -> Chroma:
     )
 
 
-def add_documents(docs: list[Document]) -> None:
+def add_documents(docs: list[Document], ids: Optional[list[str]] = None) -> None:
     store = get_vector_store()
-    store.add_documents(docs)
+    # Passing stable ids makes Chroma upsert (re-ingesting the same content won't duplicate).
+    store.add_documents(docs, ids=ids) if ids else store.add_documents(docs)
 
 
 def get_retriever(time_window: Optional[str] = None, top_k: int = 10) -> VectorStoreRetriever:

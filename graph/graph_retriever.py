@@ -20,7 +20,7 @@ class Neo4jGraphRetriever(BaseRetriever):
         window_filter = ""
         params: dict[str, Any] = {"k": self.k}
         if self.time_window:
-            window_filter = "AND (p.time_window = $time_window OR c.time_window = $time_window)"
+            window_filter = "AND p.time_window = $time_window"
             params["time_window"] = self.time_window
 
         docs = []
@@ -106,7 +106,7 @@ def check_topic_coverage(topics: list[str]) -> int:
     total = 0
     for topic in topics[:3]:
         rows = client.run(
-            "MATCH (t:Topic {name: $name}) RETURN count(t) AS c", name=topic
+            "MATCH (t:Topic {name: $name}) RETURN count(t) AS c", name=topic.lower()
         )
         total += rows[0]["c"] if rows else 0
     return total

@@ -2,7 +2,6 @@
 from langgraph.graph import StateGraph, END
 from agents.state import AgentState
 from agents.query_agent import run_query_agent
-from agents.search_agent import run_search_agent
 from agents.crawler_agent import run_crawler_agent
 from agents.parser_agent import run_parser_agent
 from agents.ingestion_agent import run_ingestion_agent
@@ -12,17 +11,16 @@ from graph.schema import init_schema
 
 def _route_after_query(state: AgentState) -> str:
     if state.get("has_rag_data", False):
-        print("[Orchestrator] RAG has data → skipping to answer")
+        print("[Orchestrator] RAG has data -> skipping to answer")
         return "answer"
-    print("[Orchestrator] RAG lacks data → triggering search pipeline")
-    return "search"
+    print("[Orchestrator] RAG lacks data -> triggering Reddit ingest pipeline")
+    return "crawl"
 
 
 def build_graph():
     graph = StateGraph(AgentState)
 
     graph.add_node("query_understanding", run_query_agent)
-    graph.add_node("search", run_search_agent)
     graph.add_node("crawl", run_crawler_agent)
     graph.add_node("parse", run_parser_agent)
     graph.add_node("ingest", run_ingestion_agent)
@@ -33,10 +31,9 @@ def build_graph():
     graph.add_conditional_edges(
         "query_understanding",
         _route_after_query,
-        {"answer": "answer", "search": "search"},
+        {"answer": "answer", "crawl": "crawl"},
     )
 
-    graph.add_edge("search", "crawl")
     graph.add_edge("crawl", "parse")
     graph.add_edge("parse", "ingest")
     graph.add_edge("ingest", "answer")
