@@ -1,11 +1,12 @@
-"""Agent 6 — Hybrid retrieval (graph + vector, RRF via EnsembleRetriever) + LLM answer."""
-from langchain.retrievers import EnsembleRetriever
+"""Agent 6 — Hybrid retrieval (graph + vector, manual RRF fusion) + LLM answer."""
+from collections import defaultdict
+from datetime import datetime, timezone
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from agents.state import AgentState
-from graph.graph_retriever import Neo4jGraphRetriever, get_topic_evolution
+from graph.graph_retriever import Neo4jGraphRetriever
 from vector.vector_store import get_retriever
 from utils.config import get_settings
 
@@ -33,6 +34,27 @@ Period 2 Context ({window2}):
 
 Compare these two time periods. What changed? What stayed the same? Highlight key trends and shifts."""),
 ])
+
+
+def reciprocal_rank_fusion(
+    graph_docs: list[Document], vector_docs: list[Document], k: int = 60
+) -> list[Document]:
+    """RRF: score(doc) = sum of 1/(k + rank) across both ranked lists."""
+    scores: dict[str, float] = defaultdict(float)
+    all_docs: dict[str, Document] = {}
+
+    for rank, doc in enumerate(graph_docs):
+        doc_id = doc.metadata.get("id") or doc.page_content[:80]
+        scores[doc_id] += 1.0 / (k + rank + 1)
+        all_docs[doc_id] = doc
+
+    for rank, doc in enumerate(vector_docs):
+        doc_id = doc.metadata.get("id") or doc.page_content[:80]
+        scores[doc_id] += 1.0 / (k + rank + 1)
+        all_docs[doc_id] = doc
+
+    sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
+    return [all_docs[doc_id] for doc_id in sorted_ids]
 
 
 def run_answer_agent(state: AgentState) -> AgentState:
@@ -70,14 +92,9 @@ def _hybrid_query(query: str, time_window: str | None, llm: ChatOllama) -> tuple
     graph_retriever = Neo4jGraphRetriever(time_window=time_window, k=8)
     vector_retriever = get_retriever(time_window=time_window, top_k=8)
 
-    ensemble = EnsembleRetriever(
-        retrievers=[graph_retriever, vector_retriever],
-        weights=[0.5, 0.5],
-    )
-
-    graph_docs = graph_retriever.get_relevant_documents(query)
-    vector_docs = vector_retriever.get_relevant_documents(query)
-    fused_docs = ensemble.get_relevant_documents(query)
+    graph_docs = graph_retriever.invoke(query)
+    vector_docs = vector_retriever.invoke(query)
+    fused_docs = reciprocal_rank_fusion(graph_docs, vector_docs)
 
     context = _format_context(fused_docs[:8])
     chain = ANSWER_PROMPT | llm | StrOutputParser()
@@ -91,13 +108,11 @@ def _temporal_comparison(query: str, windows: list[str], llm: ChatOllama) -> tup
 
     gr1 = Neo4jGraphRetriever(time_window=w1, k=5)
     vr1 = get_retriever(time_window=w1, top_k=5)
-    ens1 = EnsembleRetriever(retrievers=[gr1, vr1], weights=[0.5, 0.5])
-    docs1 = ens1.get_relevant_documents(query)
+    docs1 = reciprocal_rank_fusion(gr1.invoke(query), vr1.invoke(query))
 
     gr2 = Neo4jGraphRetriever(time_window=w2, k=5)
     vr2 = get_retriever(time_window=w2, top_k=5)
-    ens2 = EnsembleRetriever(retrievers=[gr2, vr2], weights=[0.5, 0.5])
-    docs2 = ens2.get_relevant_documents(query)
+    docs2 = reciprocal_rank_fusion(gr2.invoke(query), vr2.invoke(query))
 
     chain = COMPARE_PROMPT | llm | StrOutputParser()
     answer = chain.invoke({
@@ -118,14 +133,16 @@ def _format_context(docs: list[Document]) -> str:
         source = meta.get("source", "")
         url = meta.get("url", "")
         created = meta.get("created_utc", 0)
-        from datetime import datetime, timezone
-        date_str = datetime.fromtimestamp(float(created), tz=timezone.utc).strftime("%Y-%m-%d") if created else "unknown"
+        date_str = (
+            datetime.fromtimestamp(float(created), tz=timezone.utc).strftime("%Y-%m-%d")
+            if created else "unknown"
+        )
         parts.append(f"[{i}] Source: {source} | {url} | {date_str}\n{doc.page_content[:400]}")
     return "\n\n".join(parts)
 
 
 def _extract_sources(docs: list[Document]) -> list[dict]:
-    seen = set()
+    seen: set[str] = set()
     sources = []
     for doc in docs:
         url = doc.metadata.get("url", "")
